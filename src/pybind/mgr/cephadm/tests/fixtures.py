@@ -1,10 +1,9 @@
-import datetime
 import time
 import fnmatch
 from contextlib import contextmanager
 
 from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
-from cephadm.module import CEPH_DATEFMT
+from ceph.utils import datetime_to_str, datetime_now
 from cephadm.serve import CephadmServe
 
 try:
@@ -55,7 +54,7 @@ def with_cephadm_module(module_options=None, store=None):
             store = {}
         if '_ceph_get/mon_map' not in store:
             m.mock_store_set('_ceph_get', 'mon_map', {
-                'modified': datetime.datetime.utcnow().strftime(CEPH_DATEFMT),
+                'modified': datetime_to_str(datetime_now()),
                 'fsid': 'foobar',
             })
         for k, v in store.items():
@@ -66,13 +65,13 @@ def with_cephadm_module(module_options=None, store=None):
         yield m
 
 
-@pytest.yield_fixture()
+@pytest.fixture()
 def cephadm_module():
     with with_cephadm_module({}) as m:
         yield m
 
 
-@pytest.yield_fixture()
+@pytest.fixture()
 def rm_util():
     with with_cephadm_module({}) as m:
         r = RemoveUtil.__new__(RemoveUtil)
@@ -80,7 +79,7 @@ def rm_util():
         yield r
 
 
-@pytest.yield_fixture()
+@pytest.fixture()
 def osd_obj():
     with mock.patch("cephadm.services.osd.RemoveUtil"):
         o = OSD(0, mock.MagicMock())
@@ -147,3 +146,9 @@ def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth, h
     yield [dd.name() for dd in own_dds]
 
     assert_rm_service(cephadm_module, spec.service_name())
+
+
+def _deploy_cephadm_binary(host):
+    def foo(*args, **kwargs):
+        return True
+    return foo

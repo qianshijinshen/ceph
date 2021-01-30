@@ -38,7 +38,7 @@ void RGWRestUserPolicy::send_response()
   end_header(s);
 }
 
-int RGWRestUserPolicy::verify_permission()
+int RGWRestUserPolicy::verify_permission(optional_yield y)
 {
   if (s->auth.identity->is_anonymous()) {
     return -EACCES;
@@ -109,7 +109,7 @@ int RGWPutUserPolicy::get_params()
   return 0;
 }
 
-void RGWPutUserPolicy::execute()
+void RGWPutUserPolicy::execute(optional_yield y)
 {
   op_ret = get_params();
   if (op_ret < 0) {
@@ -120,21 +120,21 @@ void RGWPutUserPolicy::execute()
 
   RGWUserInfo info;
   rgw_user user_id(user_name);
-  op_ret = store->ctl()->user->get_info_by_uid(user_id, &info, s->yield);
+  op_ret = store->ctl()->user->get_info_by_uid(s, user_id, &info, s->yield);
   if (op_ret < 0) {
     op_ret = -ERR_NO_SUCH_ENTITY;
     return;
   }
 
   map<string, bufferlist> uattrs;
-  op_ret = store->ctl()->user->get_attrs_by_uid(user_id, &uattrs, s->yield);
+  op_ret = store->ctl()->user->get_attrs_by_uid(s, user_id, &uattrs, s->yield);
   if (op_ret == -ENOENT) {
     op_ret = -ERR_NO_SUCH_ENTITY;
     return;
   }
 
   ceph::bufferlist in_data;
-  op_ret = store->forward_request_to_master(s->user.get(), nullptr, in_data, nullptr, s->info);
+  op_ret = store->forward_request_to_master(s->user.get(), nullptr, in_data, nullptr, s->info, y);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "ERROR: forward_request_to_master returned ret=" << op_ret << dendl;
     return;
@@ -153,7 +153,7 @@ void RGWPutUserPolicy::execute()
     uattrs[RGW_ATTR_USER_POLICY] = in_bl;
 
     RGWObjVersionTracker objv_tracker;
-    op_ret = store->ctl()->user->store_info(info, s->yield,
+    op_ret = store->ctl()->user->store_info(s, info, s->yield,
                                          RGWUserCtl::PutParams()
                                          .set_objv_tracker(&objv_tracker)
                                          .set_attrs(&uattrs));
@@ -193,7 +193,7 @@ int RGWGetUserPolicy::get_params()
   return 0;
 }
 
-void RGWGetUserPolicy::execute()
+void RGWGetUserPolicy::execute(optional_yield y)
 {
   op_ret = get_params();
   if (op_ret < 0) {
@@ -202,7 +202,7 @@ void RGWGetUserPolicy::execute()
 
   rgw_user user_id(user_name);
   map<string, bufferlist> uattrs;
-  op_ret = store->ctl()->user->get_attrs_by_uid(user_id, &uattrs, s->yield);
+  op_ret = store->ctl()->user->get_attrs_by_uid(s, user_id, &uattrs, s->yield);
   if (op_ret == -ENOENT) {
     ldout(s->cct, 0) << "ERROR: attrs not found for user" << user_name << dendl;
     op_ret = -ERR_NO_SUCH_ENTITY;
@@ -257,7 +257,7 @@ int RGWListUserPolicies::get_params()
   return 0;
 }
 
-void RGWListUserPolicies::execute()
+void RGWListUserPolicies::execute(optional_yield y)
 {
   op_ret = get_params();
   if (op_ret < 0) {
@@ -266,7 +266,7 @@ void RGWListUserPolicies::execute()
 
   rgw_user user_id(user_name);
   map<string, bufferlist> uattrs;
-  op_ret = store->ctl()->user->get_attrs_by_uid(user_id, &uattrs, s->yield);
+  op_ret = store->ctl()->user->get_attrs_by_uid(s, user_id, &uattrs, s->yield);
   if (op_ret == -ENOENT) {
     ldout(s->cct, 0) << "ERROR: attrs not found for user" << user_name << dendl;
     op_ret = -ERR_NO_SUCH_ENTITY;
@@ -319,7 +319,7 @@ int RGWDeleteUserPolicy::get_params()
   return 0;
 }
 
-void RGWDeleteUserPolicy::execute()
+void RGWDeleteUserPolicy::execute(optional_yield y)
 {
   op_ret = get_params();
   if (op_ret < 0) {
@@ -329,7 +329,7 @@ void RGWDeleteUserPolicy::execute()
   RGWUserInfo info;
   map<string, bufferlist> uattrs;
   rgw_user user_id(user_name);
-  op_ret = store->ctl()->user->get_info_by_uid(user_id, &info, s->yield,
+  op_ret = store->ctl()->user->get_info_by_uid(s, user_id, &info, s->yield,
                                             RGWUserCtl::GetParams()
                                             .set_attrs(&uattrs));
   if (op_ret < 0) {
@@ -338,7 +338,7 @@ void RGWDeleteUserPolicy::execute()
   }
 
   ceph::bufferlist in_data;
-  op_ret = store->forward_request_to_master(s->user.get(), nullptr, in_data, nullptr, s->info);
+  op_ret = store->forward_request_to_master(s->user.get(), nullptr, in_data, nullptr, s->info, y);
   if (op_ret < 0) {
     // a policy might've been uploaded to this site when there was no sync
     // req. in earlier releases, proceed deletion
@@ -361,7 +361,7 @@ void RGWDeleteUserPolicy::execute()
       uattrs[RGW_ATTR_USER_POLICY] = in_bl;
 
       RGWObjVersionTracker objv_tracker;
-      op_ret = store->ctl()->user->store_info(info, s->yield,
+      op_ret = store->ctl()->user->store_info(s, info, s->yield,
                                            RGWUserCtl::PutParams()
                                            .set_old_info(&info)
                                            .set_objv_tracker(&objv_tracker)

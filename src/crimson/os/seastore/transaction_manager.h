@@ -10,6 +10,7 @@
 #include <functional>
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/iterator/counting_iterator.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
 
 #include <seastar/core/future.hh>
@@ -176,6 +177,12 @@ public:
     Transaction &t,
     laddr_t offset);
 
+  /// remove refcount for list of offset
+  using refs_ret = ref_ertr::future<std::vector<unsigned>>;
+  refs_ret dec_ref(
+    Transaction &t,
+    std::vector<laddr_t> offsets);
+
   /**
    * alloc_extent
    *
@@ -203,6 +210,35 @@ public:
       return alloc_extent_ertr::make_ready_future<TCachedExtentRef<T>>(
 	std::move(ext));
     });
+  }
+
+  /* alloc_extents
+   *
+   * allocates more than one new blocks of type T.
+   */
+   using alloc_extents_ertr = alloc_extent_ertr;
+   template<class T>
+   alloc_extents_ertr::future<std::vector<TCachedExtentRef<T>>>
+   alloc_extents(
+     Transaction &t,
+     laddr_t hint,
+     extent_len_t len,
+     int num) {
+     return seastar::do_with(std::vector<TCachedExtentRef<T>>(),
+       [this, &t, hint, len, num] (auto &extents) {
+       return crimson::do_for_each(
+                       boost::make_counting_iterator(0),
+                       boost::make_counting_iterator(num),
+         [this, &t, len, hint, &extents] (auto i) {
+         return alloc_extent<T>(t, hint, len).safe_then(
+           [&extents](auto &&node) {
+           extents.push_back(node);
+         });
+       }).safe_then([&extents] {
+         return alloc_extents_ertr::make_ready_future
+                <std::vector<TCachedExtentRef<T>>>(std::move(extents));
+       });
+     });
   }
 
   /**
@@ -235,12 +271,16 @@ public:
     laddr_t laddr,
     segment_off_t len) final;
 
+  using scan_extents_cursor =
+    SegmentCleaner::ExtentCallbackInterface::scan_extents_cursor;
+  using scan_extents_ertr =
+    SegmentCleaner::ExtentCallbackInterface::scan_extents_ertr;
   using scan_extents_ret =
     SegmentCleaner::ExtentCallbackInterface::scan_extents_ret;
   scan_extents_ret scan_extents(
-    paddr_t addr,
+    scan_extents_cursor &cursor,
     extent_len_t bytes_to_read) final {
-    return journal.scan_extents(addr, bytes_to_read);
+    return journal.scan_extents(cursor, bytes_to_read);
   }
 
   using release_segment_ret =
@@ -248,6 +288,32 @@ public:
   release_segment_ret release_segment(
     segment_id_t id) final {
     return segment_manager.release(id);
+  }
+
+  /**
+   * read_onode_root
+   *
+   * Get onode-tree root logical address
+   */
+  using read_onode_root_ertr = crimson::errorator<
+    crimson::ct_error::input_output_error
+    >;
+  using read_onode_root_ret = read_onode_root_ertr::future<laddr_t>;
+  read_onode_root_ret read_onode_root(Transaction &t) {
+    return cache.get_root(t).safe_then([](auto croot) {
+      return croot->get_root().onode_root;
+    });
+  }
+
+  /**
+   * write_onode_root
+   *
+   * Write onode-tree root logical address, must be called after read.
+   */
+  void write_onode_root(Transaction &t, laddr_t addr) {
+    auto croot = cache.get_root_fast(t);
+    croot = cache.duplicate_for_write(t, croot)->cast<RootBlock>();
+    croot->get_root().onode_root = addr;
   }
 
   ~TransactionManager();

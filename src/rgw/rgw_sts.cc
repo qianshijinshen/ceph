@@ -276,19 +276,33 @@ int AssumeRoleRequest::validate_input() const
   return AssumeRoleRequestBase::validate_input();
 }
 
-std::tuple<int, RGWRole> STSService::getRoleInfo(const string& arn)
+std::tuple<int, RGWRole> STSService::getRoleInfo(const DoutPrefixProvider *dpp, 
+                                                 const string& arn,
+						 optional_yield y)
 {
   if (auto r_arn = rgw::ARN::parse(arn); r_arn) {
     auto pos = r_arn->resource.find_last_of('/');
     string roleName = r_arn->resource.substr(pos + 1);
     RGWRole role(cct, store->getRados()->pctl, roleName, r_arn->account);
-    if (int ret = role.get(); ret < 0) {
+    if (int ret = role.get(dpp, y); ret < 0) {
       if (ret == -ENOENT) {
         ldout(cct, 0) << "Role doesn't exist: " << roleName << dendl;
         ret = -ERR_NO_ROLE_FOUND;
       }
       return make_tuple(ret, this->role);
     } else {
+      auto path_pos = r_arn->resource.find('/');
+      string path;
+      if (path_pos == pos) {
+        path = "/";
+      } else {
+        path = r_arn->resource.substr(path_pos, ((pos - path_pos) + 1));
+      }
+      string r_path = role.get_path();
+      if (path != r_path) {
+        ldout(cct, 0) << "Invalid Role ARN: Path in ARN does not match with the role path: " << path << " " << r_path << dendl;
+        return make_tuple(-EACCES, this->role);
+      }
       this->role = std::move(role);
       return make_tuple(0, this->role);
     }
@@ -298,19 +312,19 @@ std::tuple<int, RGWRole> STSService::getRoleInfo(const string& arn)
   }
 }
 
-int STSService::storeARN(string& arn)
+int STSService::storeARN(const DoutPrefixProvider *dpp, string& arn, optional_yield y)
 {
   int ret = 0;
   RGWUserInfo info;
-  if (ret = rgw_get_user_info_by_uid(store->ctl()->user, user_id, info); ret < 0) {
+  if (ret = rgw_get_user_info_by_uid(dpp, store->ctl()->user, user_id, info, y); ret < 0) {
     return -ERR_NO_SUCH_ENTITY;
   }
 
   info.assumed_role_arn = arn;
 
   RGWObjVersionTracker objv_tracker;
-  if (ret = rgw_store_user_info(store->ctl()->user, info, &info, &objv_tracker, real_time(),
-          false); ret < 0) {
+  if (ret = rgw_store_user_info(dpp, store->ctl()->user, info, &info, &objv_tracker, real_time(),
+				false, y); ret < 0) {
     return -ERR_INTERNAL_ERROR;
   }
   return ret;
@@ -379,7 +393,9 @@ AssumeRoleWithWebIdentityResponse STSService::assumeRoleWithWebIdentity(AssumeRo
   return response;
 }
 
-AssumeRoleResponse STSService::assumeRole(AssumeRoleRequest& req)
+AssumeRoleResponse STSService::assumeRole(const DoutPrefixProvider *dpp, 
+                                          AssumeRoleRequest& req,
+					  optional_yield y)
 {
   AssumeRoleResponse response;
   response.packedPolicySize = 0;
@@ -425,7 +441,7 @@ AssumeRoleResponse STSService::assumeRole(AssumeRoleRequest& req)
 
   //Save ARN with the user
   string arn = response.user.getARN();
-  response.retCode = storeARN(arn);
+  response.retCode = storeARN(dpp, arn, y);
   if (response.retCode < 0) {
     return response;
   }

@@ -18,6 +18,7 @@
 
 #include "acconfig.h"
 #include "include/int_types.h"
+#include "include/scope_guard.h"
 
 #include <libgen.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 
 #include "nbd-netlink.h"
 #include <libnl3/netlink/genl/genl.h>
@@ -113,6 +115,9 @@ struct Config {
   std::string format;
   bool pretty_format = false;
 
+  std::optional<librbd::encryption_format_t> encryption_format;
+  std::optional<std::string> encryption_passphrase_file;
+
   Command command = None;
   int pid = 0;
 
@@ -140,18 +145,21 @@ static void usage()
             << "               unmap <device|image-or-snap-spec>     Unmap nbd device\n"
             << "               [options] list-mapped                 List mapped nbd devices\n"
             << "Map and attach options:\n"
-            << "  --device <device path>   Specify nbd device path (/dev/nbd{num})\n"
-            << "  --exclusive              Forbid writes by other clients\n"
-            << "  --io-timeout <sec>       Set nbd IO timeout\n"
-            << "  --max_part <limit>       Override for module param max_part\n"
-            << "  --nbds_max <limit>       Override for module param nbds_max\n"
-            << "  --quiesce                Use quiesce callbacks\n"
-            << "  --quiesce-hook <path>    Specify quiesce hook path\n"
-            << "                           (default: " << Config().quiesce_hook << ")\n"
-            << "  --read-only              Map read-only\n"
-            << "  --reattach-timeout <sec> Set nbd re-attach timeout\n"
-            << "                           (default: " << Config().reattach_timeout << ")\n"
-            << "  --try-netlink            Use the nbd netlink interface\n"
+            << "  --device <device path>        Specify nbd device path (/dev/nbd{num})\n"
+            << "  --encryption-format           Image encryption format\n"
+            << "                                (possible values: luks1, luks2)\n"
+            << "  --encryption-passphrase-file  Path of file containing passphrase for unlocking image encryption\n"
+            << "  --exclusive                   Forbid writes by other clients\n"
+            << "  --io-timeout <sec>            Set nbd IO timeout\n"
+            << "  --max_part <limit>            Override for module param max_part\n"
+            << "  --nbds_max <limit>            Override for module param nbds_max\n"
+            << "  --quiesce                     Use quiesce callbacks\n"
+            << "  --quiesce-hook <path>         Specify quiesce hook path\n"
+            << "                                (default: " << Config().quiesce_hook << ")\n"
+            << "  --read-only                   Map read-only\n"
+            << "  --reattach-timeout <sec>      Set nbd re-attach timeout\n"
+            << "                                (default: " << Config().reattach_timeout << ")\n"
+            << "  --try-netlink                 Use the nbd netlink interface\n"
             << "\n"
             << "List options:\n"
             << "  --format plain|json|xml Output format (default: plain)\n"
@@ -180,6 +188,7 @@ static EventSocket terminate_event_sock;
 
 static int parse_args(vector<const char*>& args, std::ostream *err_msg,
                       Config *cfg);
+static int netlink_disconnect(int index);
 static int netlink_resize(int nbd_index, uint64_t size);
 
 static int run_quiesce_hook(const std::string &quiesce_hook,
@@ -360,7 +369,7 @@ private:
         }
         r = -errno;
         derr << "failed to poll nbd: " << cpp_strerror(r) << dendl;
-        goto signal;
+        goto error;
       }
 
       if ((poll_fds[1].revents & POLLIN) != 0) {
@@ -377,7 +386,7 @@ private:
       if (r < 0) {
 	derr << "failed to read nbd request header: " << cpp_strerror(r)
 	     << dendl;
-	goto signal;
+	goto error;
       }
 
       if (ctx->request.magic != htonl(NBD_REQUEST_MAGIC)) {
@@ -408,7 +417,7 @@ private:
           if (r < 0) {
 	    derr << *ctx << ": failed to read nbd request data: "
 		 << cpp_strerror(r) << dendl;
-            goto signal;
+            goto error;
 	  }
           ctx->data.push_back(ptr);
           break;
@@ -436,6 +445,13 @@ private:
 	  derr << *pctx << ": invalid request command" << dendl;
           c->release();
           goto signal;
+      }
+    }
+error:
+    {
+      int r = netlink_disconnect(nbd_index);
+      if (r == 1) {
+        ioctl(nbd, NBD_DISCONNECT);
       }
     }
 signal:
@@ -814,9 +830,11 @@ private:
   std::map<int, Config> m_mapped_info_cache;
 
   int get_mapped_info(int pid, Config *cfg) {
+    ceph_assert(!cfg->devpath.empty());
+
     auto it = m_mapped_info_cache.find(pid);
     if (it != m_mapped_info_cache.end()) {
-      if (it->second.devpath.empty()) {
+      if (it->second.devpath != cfg->devpath) {
         return -EINVAL;
       }
       *cfg = it->second;
@@ -826,8 +844,19 @@ private:
     m_mapped_info_cache[pid] = {};
 
     int r;
-    std::string path = "/proc/" + stringify(pid) + "/cmdline";
+    std::string path = "/proc/" + stringify(pid) + "/comm";
     std::ifstream ifs;
+    std::string comm;
+    ifs.open(path.c_str(), std::ifstream::in);
+    if (!ifs.is_open())
+      return -1;
+    ifs >> comm;
+    if (comm != "rbd-nbd") {
+      return -EINVAL;
+    }
+    ifs.close();
+
+    path = "/proc/" + stringify(pid) + "/cmdline";
     std::string cmdline;
     std::vector<const char*> args;
 
@@ -856,22 +885,28 @@ private:
     }
 
     std::ostringstream err_msg;
-    r = parse_args(args, &err_msg, cfg);
+    Config c;
+    r = parse_args(args, &err_msg, &c);
     if (r < 0) {
       return r;
     }
 
-    if (cfg->command != Map && cfg->command != Attach) {
+    if (c.command != Map && c.command != Attach) {
       return -ENOENT;
     }
 
-    cfg->pid = pid;
-
+    c.pid = pid;
     m_mapped_info_cache.erase(pid);
-    if (!cfg->devpath.empty()) {
-      m_mapped_info_cache[pid] = *cfg;
+    if (!c.devpath.empty()) {
+      m_mapped_info_cache[pid] = c;
+      if (c.devpath != cfg->devpath) {
+        return -ENOENT;
+      }
+    } else {
+      c.devpath = cfg->devpath;
     }
 
+    *cfg = c;
     return 0;
   }
 
@@ -889,8 +924,8 @@ private:
       }
 
       Config cfg;
-      if (get_mapped_info(pid, &cfg) >=0 && cfg.devpath == devpath &&
-          cfg.command == Attach) {
+      cfg.devpath = devpath;
+      if (get_mapped_info(pid, &cfg) >=0 && cfg.command == Attach) {
         return cfg.pid;
       }
     }
@@ -974,7 +1009,8 @@ static int parse_nbd_index(const std::string& devpath)
   return index;
 }
 
-static int try_ioctl_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
+static int try_ioctl_setup(Config *cfg, int fd, uint64_t size,
+                           uint64_t blksize, uint64_t flags)
 {
   int index = 0, r;
 
@@ -1037,7 +1073,7 @@ static int try_ioctl_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
     }
   }
 
-  r = ioctl(nbd, NBD_SET_BLKSIZE, RBD_NBD_BLKSIZE);
+  r = ioctl(nbd, NBD_SET_BLKSIZE, blksize);
   if (r < 0) {
     r = -errno;
     cerr << "rbd-nbd: NBD_SET_BLKSIZE failed" << std::endl;
@@ -1431,25 +1467,54 @@ static void run_server(Preforker& forker, NBDServer *server, bool netlink_used)
   shutdown_async_signal_handler();
 }
 
-// Eventually it should be replaced with glibc' pidfd_open
-// when it is widely available.
-static int
-pidfd_open(pid_t pid, unsigned int)
+// Eventually it should be removed when pidfd_open is widely supported.
+
+static int wait_for_terminate_legacy(int pid, int timeout)
 {
-  std::string path = "/proc/" + stringify(pid);
-  int fd = open(path.c_str(), O_RDONLY);
-  if (fd == -1 && errno == ENOENT) {
-    errno = ESRCH;
+  for (int i = 0; ; i++) {
+    if (kill(pid, 0) == -1) {
+      if (errno == ESRCH) {
+        return 0;
+      }
+      int r = -errno;
+      cerr << "rbd-nbd: kill(" << pid << ", 0) failed: "
+           << cpp_strerror(r) << std::endl;
+      return r;
+    }
+    if (i >= timeout * 2) {
+      break;
+    }
+    usleep(500000);
   }
 
-  return fd;
+  cerr << "rbd-nbd: waiting for process exit timed out" << std::endl;
+  return -ETIMEDOUT;
 }
+
+// Eventually it should be replaced with glibc' pidfd_open
+// when it is widely available.
+
+#ifdef __NR_pidfd_open
+static int pidfd_open(pid_t pid, unsigned int flags)
+{
+  return syscall(__NR_pidfd_open, pid, flags);
+}
+#else
+static int pidfd_open(pid_t pid, unsigned int flags)
+{
+  errno = ENOSYS;
+  return -1;
+}
+#endif
 
 static int wait_for_terminate(int pid, int timeout)
 {
   int fd = pidfd_open(pid, 0);
   if (fd == -1) {
-    if (errno == -ESRCH) {
+    if (errno == ENOSYS) {
+      return wait_for_terminate_legacy(pid, timeout);
+    }
+    if (errno == ESRCH) {
       return 0;
     }
     int r = -errno;
@@ -1469,6 +1534,8 @@ static int wait_for_terminate(int pid, int timeout)
     cerr << "rbd-nbd: failed to poll rbd-nbd process: " << cpp_strerror(r)
          << std::endl;
     goto done;
+  } else {
+    r = 0;
   }
 
   if ((poll_fds[0].revents & POLLIN) == 0) {
@@ -1494,6 +1561,7 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
   int read_only = 0;
   unsigned long flags;
   unsigned long size;
+  unsigned long blksize = RBD_NBD_BLKSIZE;
   bool use_netlink;
 
   int fd[2];
@@ -1576,6 +1644,57 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
       goto close_fd;
   }
 
+  if (cfg->encryption_format.has_value()) {
+    if (!cfg->encryption_passphrase_file.has_value()) {
+      r = -EINVAL;
+      cerr << "rbd-nbd: missing encryption-passphrase-file" << std::endl;
+      goto close_fd;
+    }
+    std::ifstream file(cfg->encryption_passphrase_file.value().c_str());
+    if (file.fail()) {
+      r = -errno;
+      std::cerr << "rbd-nbd: unable to open passphrase file:"
+                << cpp_strerror(errno) << std::endl;
+      goto close_fd;
+    }
+    std::string passphrase((std::istreambuf_iterator<char>(file)),
+                           (std::istreambuf_iterator<char>()));
+    auto sg = make_scope_guard([&] {
+      explicit_bzero(&passphrase[0], passphrase.size()); });
+    file.close();
+    if (!passphrase.empty() && passphrase[passphrase.length() - 1] == '\n') {
+      passphrase.erase(passphrase.length() - 1);
+    }
+
+    switch (cfg->encryption_format.value()) {
+      case RBD_ENCRYPTION_FORMAT_LUKS1: {
+        librbd::encryption_luks1_format_options_t opts = {};
+        opts.passphrase = passphrase;
+        r = image.encryption_load(
+                RBD_ENCRYPTION_FORMAT_LUKS1, &opts, sizeof(opts));
+        break;
+      }
+      case RBD_ENCRYPTION_FORMAT_LUKS2: {
+        librbd::encryption_luks2_format_options_t opts = {};
+        opts.passphrase = passphrase;
+        r = image.encryption_load(
+                RBD_ENCRYPTION_FORMAT_LUKS2, &opts, sizeof(opts));
+        blksize = 4096;
+        break;
+      }
+      default:
+        r = -ENOTSUP;
+        cerr << "rbd-nbd: unsupported encryption format" << std::endl;
+        goto close_fd;
+    }
+
+    if (r != 0) {
+      cerr << "rbd-nbd: failed to load encryption: " << cpp_strerror(r)
+           << std::endl;
+      goto close_fd;
+    }
+  }
+
   r = image.stat(info, sizeof(info));
   if (r < 0)
     goto close_fd;
@@ -1612,7 +1731,7 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
   }
 
   if (!use_netlink) {
-    r = try_ioctl_setup(cfg, fd[0], size, flags);
+    r = try_ioctl_setup(cfg, fd[0], size, blksize, flags);
     if (r < 0)
       goto free_server;
   }
@@ -1699,34 +1818,39 @@ static int do_detach(Config *cfg)
 
 static int do_unmap(Config *cfg)
 {
-  int r, nbd;
-
   /*
    * The netlink disconnect call supports devices setup with netlink or ioctl,
    * so we always try that first.
    */
-  r = netlink_disconnect_by_path(cfg->devpath);
-  if (r != 1)
+  int r = netlink_disconnect_by_path(cfg->devpath);
+  if (r < 0) {
     return r;
-
-  nbd = open(cfg->devpath.c_str(), O_RDWR);
-  if (nbd < 0) {
-    cerr << "rbd-nbd: failed to open device: " << cfg->devpath << std::endl;
-    return nbd;
   }
 
-  r = ioctl(nbd, NBD_DISCONNECT);
-  if (r < 0) {
+  if (r == 1) {
+    int nbd = open(cfg->devpath.c_str(), O_RDWR);
+    if (nbd < 0) {
+      cerr << "rbd-nbd: failed to open device: " << cfg->devpath << std::endl;
+      return nbd;
+    }
+
+    r = ioctl(nbd, NBD_DISCONNECT);
+    if (r < 0) {
       cerr << "rbd-nbd: the device is not used" << std::endl;
+    }
+
+    close(nbd);
+
+    if (r < 0) {
+      return r;
+    }
   }
 
-  close(nbd);
-
-  if (r < 0) {
-    return r;
+  if (cfg->pid > 0) {
+    r = wait_for_terminate(cfg->pid, cfg->reattach_timeout);
   }
 
-  return wait_for_terminate(cfg->pid, cfg->reattach_timeout);
+  return 0;
 }
 
 static int parse_imgpath(const std::string &imgpath, Config *cfg,
@@ -1818,7 +1942,8 @@ static bool find_mapped_dev_by_spec(Config *cfg, int skip_pid=-1) {
   while (it.get(&c)) {
     if (c.pid != skip_pid &&
         c.poolname == cfg->poolname && c.nsname == cfg->nsname &&
-        c.imgname == cfg->imgname && c.snapname == cfg->snapname) {
+        c.imgname == cfg->imgname && c.snapname == cfg->snapname &&
+        (cfg->devpath.empty() || c.devpath == cfg->devpath)) {
       *cfg = c;
       return true;
     }
@@ -1826,6 +1951,17 @@ static bool find_mapped_dev_by_spec(Config *cfg, int skip_pid=-1) {
   return false;
 }
 
+static int find_proc_by_dev(Config *cfg) {
+  Config c;
+  NBDListIterator it;
+  while (it.get(&c)) {
+    if (c.devpath == cfg->devpath) {
+      *cfg = c;
+      return true;
+    }
+  }
+  return false;
+}
 
 static int parse_args(vector<const char*>& args, std::ostream *err_msg,
                       Config *cfg) {
@@ -1849,6 +1985,7 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
 
   std::vector<const char*>::iterator i;
   std::ostringstream err;
+  std::string arg_value;
 
   for (i = args.begin(); i != args.end(); ) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
@@ -1920,6 +2057,22 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
       cfg->pretty_format = true;
     } else if (ceph_argparse_flag(args, i, "--try-netlink", (char *)NULL)) {
       cfg->try_netlink = true;
+    } else if (ceph_argparse_witharg(args, i, &arg_value,
+                                     "--encryption-format", (char *)NULL)) {
+      if (arg_value == "luks1") {
+        cfg->encryption_format =
+                std::make_optional(RBD_ENCRYPTION_FORMAT_LUKS1);
+      } else if (arg_value == "luks2") {
+        cfg->encryption_format =
+                std::make_optional(RBD_ENCRYPTION_FORMAT_LUKS2);
+      } else {
+        *err_msg << "rbd-nbd: Invalid encryption format";
+        return -EINVAL;
+      }
+    } else if (ceph_argparse_witharg(args, i, &arg_value,
+                                     "--encryption-passphrase-file",
+                                     (char *)NULL)) {
+      cfg->encryption_passphrase_file = std::make_optional(arg_value);
     } else {
       ++i;
     }
@@ -1954,7 +2107,7 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
       if (cfg->devpath.empty()) {
         *err_msg << "rbd-nbd: must specify device to attach";
         return -EINVAL;
-      }      
+      }
       [[fallthrough]];
     case Map:
       if (args.begin() == args.end()) {
@@ -2039,8 +2192,14 @@ static int rbd_nbd(int argc, const char *argv[])
         return -EINVAL;
       break;
     case Detach:
-      if (cfg.devpath.empty() && !find_mapped_dev_by_spec(&cfg)) {
-        cerr << "rbd-nbd: " << cfg.image_spec() << " is not mapped"
+      if (cfg.devpath.empty()) {
+        if (!find_mapped_dev_by_spec(&cfg)) {
+          cerr << "rbd-nbd: " << cfg.image_spec() << " is not mapped"
+               << std::endl;
+          return -ENOENT;
+        }
+      } else if (!find_proc_by_dev(&cfg)) {
+        cerr << "rbd-nbd: no process attached to " << cfg.devpath << " found"
              << std::endl;
         return -ENOENT;
       }
@@ -2049,10 +2208,14 @@ static int rbd_nbd(int argc, const char *argv[])
         return -EINVAL;
       break;
     case Unmap:
-      if (cfg.devpath.empty() && !find_mapped_dev_by_spec(&cfg)) {
-        cerr << "rbd-nbd: " << cfg.image_spec() << " is not mapped"
-             << std::endl;
-        return -ENOENT;
+      if (cfg.devpath.empty()) {
+        if (!find_mapped_dev_by_spec(&cfg)) {
+          cerr << "rbd-nbd: " << cfg.image_spec() << " is not mapped"
+               << std::endl;
+          return -ENOENT;
+        }
+      } else if (!find_proc_by_dev(&cfg)) {
+        // still try to send disconnect to the device
       }
       r = do_unmap(&cfg);
       if (r < 0)

@@ -13,9 +13,7 @@
  */
 
 #include <errno.h>
-#include <fstream>
-#include <iostream>
-#include <sstream>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <map>
@@ -190,7 +188,7 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
       }
       since = now-upkeep_last_release;
       auto release_interval = clock::duration(g_conf().get_val<std::chrono::seconds>("mds_cache_release_free_interval"));
-      if (since >= release_interval) {
+      if (since >= release_interval*.90) {
         /* XXX not necessary once MDCache uses PriorityCache */
         dout(10) << "releasing free memory" << dendl;
         ceph_heap_release_free_memory();
@@ -507,7 +505,7 @@ void MDCache::create_mydir_hierarchy(MDSGather *gather)
     CDir *straydir = stray->get_or_open_dirfrag(this, frag_t());
     CachedStackStringStream css;
     *css << "stray" << i;
-    CDentry *sdn = mydir->add_primary_dentry(css->str(), stray);
+    CDentry *sdn = mydir->add_primary_dentry(css->str(), stray, "");
     sdn->_mark_dirty(mds->mdlog->get_current_segment());
 
     stray->_get_inode()->dirstat = straydir->get_fnode()->fragstat;
@@ -1666,8 +1664,7 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
 	dn->first = dir_follows+1;
 	if (realm->has_snaps_in_range(oldfirst, dir_follows)) {
 	  CDir *dir = dn->dir;
-	  CDentry *olddn = dir->add_remote_dentry(dn->get_name(), in->ino(), in->d_type(),
-						  oldfirst, dir_follows);
+	  CDentry *olddn = dir->add_remote_dentry(dn->get_name(), in->ino(), in->d_type(), dn->alternate_name, oldfirst, dir_follows);
 	  dout(10) << " olddn " << *olddn << dendl;
 	  ceph_assert(dir->is_projected());
 	  olddn->set_projected_version(dir->get_projected_version());
@@ -1741,7 +1738,7 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
       mut->add_cow_inode(oldin);
       if (pcow_inode)
 	*pcow_inode = oldin;
-      CDentry *olddn = dir->add_primary_dentry(dn->get_name(), oldin, oldfirst, follows);
+      CDentry *olddn = dir->add_primary_dentry(dn->get_name(), oldin, dn->alternate_name, oldfirst, follows);
       dout(10) << " olddn " << *olddn << dendl;
       bool need_snapflush = !oldin->client_snap_caps.empty();
       if (need_snapflush) {
@@ -1753,8 +1750,7 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
       mut->add_cow_dentry(olddn);
     } else {
       ceph_assert(dnl->is_remote());
-      CDentry *olddn = dir->add_remote_dentry(dn->get_name(), dnl->get_remote_ino(), dnl->get_remote_d_type(),
-						  oldfirst, follows);
+      CDentry *olddn = dir->add_remote_dentry(dn->get_name(), dnl->get_remote_ino(), dnl->get_remote_d_type(), dn->alternate_name, oldfirst, follows);
       dout(10) << " olddn " << *olddn << dendl;
 
       olddn->set_projected_version(dir->get_projected_version());
@@ -4334,7 +4330,8 @@ void MDCache::rejoin_walk(CDir *dir, const ref_t<MMDSCacheRejoin> &rejoin)
       }
 
       dout(15) << " add_strong_dentry " << *dn << dendl;
-      rejoin->add_strong_dentry(dir->dirfrag(), dn->get_name(), dn->first, dn->last,
+      rejoin->add_strong_dentry(dir->dirfrag(), dn->get_name(), dn->get_alternate_name(),
+                                dn->first, dn->last,
 				dnl->is_primary() ? dnl->get_inode()->ino():inodeno_t(0),
 				dnl->is_remote() ? dnl->get_remote_ino():inodeno_t(0),
 				dnl->is_remote() ? dnl->get_remote_d_type():0, 
@@ -4556,7 +4553,8 @@ void MDCache::handle_cache_rejoin_weak(const cref_t<MMDSCacheRejoin> &weak)
       unsigned dnonce = dn->add_replica(from);
       dout(10) << " have " << *dn << dendl;
       if (ack) 
-	ack->add_strong_dentry(dir->dirfrag(), dn->get_name(), dn->first, dn->last,
+	ack->add_strong_dentry(dir->dirfrag(), dn->get_name(), dn->get_alternate_name(),
+                               dn->first, dn->last,
 			       dnl->get_inode()->ino(), inodeno_t(0), 0, 
 			       dnonce, dn->lock.get_replica_state());
 
@@ -4807,13 +4805,13 @@ void MDCache::handle_cache_rejoin_strong(const cref_t<MMDSCacheRejoin> &strong)
         }
         if (!dn) {
 	  if (d.is_remote()) {
-	    dn = dir->add_remote_dentry(ss.name, d.remote_ino, d.remote_d_type, d.first, ss.snapid);
+	    dn = dir->add_remote_dentry(ss.name, d.remote_ino, d.remote_d_type, mempool::mds_co::string(d.alternate_name), d.first, ss.snapid);
 	  } else if (d.is_null()) {
 	    dn = dir->add_null_dentry(ss.name, d.first, ss.snapid);
 	  } else {
 	    CInode *in = get_inode(d.ino, ss.snapid);
 	    if (!in) in = rejoin_invent_inode(d.ino, ss.snapid);
-	    dn = dir->add_primary_dentry(ss.name, in, d.first, ss.snapid);
+	    dn = dir->add_primary_dentry(ss.name, in, mempool::mds_co::string(d.alternate_name), d.first, ss.snapid);
 	  }
 	  dout(10) << " invented " << *dn << dendl;
         }
@@ -6165,7 +6163,8 @@ void MDCache::rejoin_send_acks()
 	  auto it = acks.find(r.first);
 	  if (it == acks.end())
 	    continue;
-	  it->second->add_strong_dentry(dir->dirfrag(), dn->get_name(), dn->first, dn->last,
+	  it->second->add_strong_dentry(dir->dirfrag(), dn->get_name(), dn->get_alternate_name(),
+                                           dn->first, dn->last,
 					   dnl->is_primary() ? dnl->get_inode()->ino():inodeno_t(0),
 					   dnl->is_remote() ? dnl->get_remote_ino():inodeno_t(0),
 					   dnl->is_remote() ? dnl->get_remote_d_type():0,
@@ -9650,6 +9649,9 @@ void MDCache::dispatch_request(MDRequestRef& mdr)
     case CEPH_MDS_OP_REPAIR_INODESTATS:
       repair_inode_stats_work(mdr);
       break;
+    case CEPH_MDS_OP_RDLOCK_FRAGSSTATS:
+      rdlock_dirfrags_stats_work(mdr);
+      break;
     default:
       ceph_abort();
     }
@@ -10657,7 +10659,7 @@ void MDCache::encode_replica_dir(CDir *dir, mds_rank_t to, bufferlist& bl)
 
 void MDCache::encode_replica_dentry(CDentry *dn, mds_rank_t to, bufferlist& bl)
 {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   encode(dn->get_name(), bl);
   encode(dn->last, bl);
 
@@ -10669,6 +10671,7 @@ void MDCache::encode_replica_dentry(CDentry *dn, mds_rank_t to, bufferlist& bl)
   dn->lock.encode_state_for_replica(bl);
   bool need_recover = mds->get_state() < MDSMap::STATE_ACTIVE;
   encode(need_recover, bl);
+  encode(dn->alternate_name, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -10773,11 +10776,19 @@ void MDCache::decode_replica_dentry(CDentry *&dn, bufferlist::const_iterator& p,
   bool need_recover;
   decode(need_recover, p);
 
+  mempool::mds_co::string alternate_name;
+  if (struct_v >= 2) {
+    decode(alternate_name, p);
+  }
+
   if (is_new) {
+    dn->set_alternate_name(std::move(alternate_name));
     if (rino)
       dir->link_remote_inode(dn, rino, rdtype);
     if (need_recover)
       dn->lock.mark_need_recover();
+  } else {
+    ceph_assert(dn->alternate_name == alternate_name);
   }
 
   dir->take_dentry_waiting(name, dn->first, dn->last, finished);
@@ -10879,7 +10890,17 @@ int MDCache::send_dir_updates(CDir *dir, bool bcast)
 
   set<mds_rank_t> who;
   if (bcast) {
-    mds->get_mds_map()->get_active_mds_set(who);
+    set<mds_rank_t> mds_set;
+    mds->get_mds_map()->get_active_mds_set(mds_set);
+
+    set<mds_rank_t> replica_set;
+    for (const auto &p : dir->get_replicas()) {
+      replica_set.insert(p.first);
+    }
+
+    std::set_difference(mds_set.begin(), mds_set.end(),
+                        replica_set.begin(), replica_set.end(),
+                        std::inserter(who, who.end()));
   } else {
     for (const auto &p : dir->get_replicas()) {
       who.insert(p.first);
@@ -10891,6 +10912,11 @@ int MDCache::send_dir_updates(CDir *dir, bool bcast)
   filepath path;
   dir->inode->make_path(path);
 
+  std::set<int32_t> dir_rep_set;
+  for (const auto &r : dir->dir_rep_by) {
+    dir_rep_set.insert(r);
+  }
+
   mds_rank_t whoami = mds->get_nodeid();
   for (set<mds_rank_t>::iterator it = who.begin();
        it != who.end();
@@ -10899,11 +10925,7 @@ int MDCache::send_dir_updates(CDir *dir, bool bcast)
     //if (*it == except) continue;
     dout(7) << "sending dir_update on " << *dir << " to " << *it << dendl;
 
-    std::set<int32_t> s;
-    for (const auto &r : dir->dir_rep_by) {
-      s.insert(r);
-    }
-    mds->send_message_mds(make_message<MDirUpdate>(mds->get_nodeid(), dir->dirfrag(), dir->dir_rep, s, path, bcast), *it);
+    mds->send_message_mds(make_message<MDirUpdate>(mds->get_nodeid(), dir->dirfrag(), dir->dir_rep, dir_rep_set, path, bcast), *it);
   }
 
   return 0;
@@ -11396,12 +11418,12 @@ bool MDCache::can_fragment(CInode *diri, const std::vector<CDir*>& dirs)
     return false;
   }
 
-  if (diri->scrub_is_in_progress()) {
-    dout(7) << "can_fragment: scrub in progress" << dendl;
-    return false;
-  }
-
   for (const auto& dir : dirs) {
+    if (dir->scrub_is_in_progress()) {
+      dout(7) << "can_fragment: scrub in progress " << *dir << dendl;
+      return false;
+    }
+
     if (dir->state_test(CDir::STATE_FRAGMENTING)) {
       dout(7) << "can_fragment: already fragmenting " << *dir << dendl;
       return false;
@@ -11901,6 +11923,7 @@ void MDCache::_fragment_logged(MDRequestRef& mdr)
   for (const auto& dir : info.resultfrags) {
     dout(10) << " storing result frag " << *dir << dendl;
 
+    dir->mark_dirty(mdr->ls);
     dir->mark_new(mdr->ls);
 
     // freeze and store them too
@@ -12692,18 +12715,20 @@ int MDCache::dump_cache(std::string_view fn, Formatter *f)
   return r;
 }
 
-
-
-C_MDS_RetryRequest::C_MDS_RetryRequest(MDCache *c, MDRequestRef& r)
-  : MDSInternalContext(c->mds), cache(c), mdr(r)
-{}
-
 void C_MDS_RetryRequest::finish(int r)
 {
   mdr->retry++;
   cache->dispatch_request(mdr);
 }
 
+MDSContext *CF_MDS_RetryRequestFactory::build()
+{
+  if (drop_locks) {
+    mdcache->mds->locker->drop_locks(mdr.get(), nullptr);
+    mdr->drop_local_auth_pins();
+  }
+  return new C_MDS_RetryRequest(mdcache, mdr);
+}
 
 class C_MDS_EnqueueScrub : public Context
 {
@@ -12715,23 +12740,15 @@ public:
   C_MDS_EnqueueScrub(std::string_view tag, Formatter *f, Context *fin) :
     tag(tag), formatter(f), on_finish(fin), header(nullptr) {}
 
-  Context *take_finisher() {
-    Context *fin = on_finish;
-    on_finish = NULL;
-    return fin;
-  }
-
   void finish(int r) override {
     if (r == 0) {
       // since recursive scrub is asynchronous, dump minimal output
       // to not upset cli tools.
-      if (header && header->get_recursive()) {
-        formatter->open_object_section("results");
-        formatter->dump_int("return_code", 0);
-        formatter->dump_string("scrub_tag", tag);
-        formatter->dump_string("mode", "asynchronous");
-        formatter->close_section(); // results
-      }
+      formatter->open_object_section("results");
+      formatter->dump_int("return_code", 0);
+      formatter->dump_string("scrub_tag", tag);
+      formatter->dump_string("mode", "asynchronous");
+      formatter->close_section(); // results
     } else { // we failed the lookup or something; dump ourselves
       formatter->open_object_section("results");
       formatter->dump_int("return_code", r);
@@ -12750,14 +12767,26 @@ void MDCache::enqueue_scrub(
     Formatter *f, Context *fin)
 {
   dout(10) << __func__ << " " << path << dendl;
-  MDRequestRef mdr = request_start_internal(CEPH_MDS_OP_ENQUEUE_SCRUB);
-  if (path == "~mdsdir") {
-    filepath fp(MDS_INO_MDSDIR(mds->get_nodeid()));
-    mdr->set_filepath(fp);
-  } else {
-    filepath fp(path);
-    mdr->set_filepath(path);
+
+  filepath fp;
+  if (path.compare(0, 4, "~mds") == 0) {
+    mds_rank_t rank;
+    if (path == "~mdsdir") {
+      rank = mds->get_nodeid();
+    } else {
+      std::string err;
+      rank = strict_strtoll(path.substr(4), 10, &err);
+      if (!err.empty())
+	rank = MDS_RANK_NONE;
+    }
+    if (rank >= 0 && rank < MAX_MDS)
+      fp.set_path("", MDS_INO_MDSDIR(rank));
   }
+  if (fp.get_ino() == inodeno_t(0))
+    fp.set_path(path);
+
+  MDRequestRef mdr = request_start_internal(CEPH_MDS_OP_ENQUEUE_SCRUB);
+  mdr->set_filepath(fp);
 
   bool is_internal = false;
   std::string tag_str(tag);
@@ -12769,8 +12798,7 @@ void MDCache::enqueue_scrub(
   }
 
   C_MDS_EnqueueScrub *cs = new C_MDS_EnqueueScrub(tag_str, f, fin);
-  cs->header = std::make_shared<ScrubHeader>(
-    tag_str, is_internal, force, recursive, repair, f);
+  cs->header = std::make_shared<ScrubHeader>(tag_str, is_internal, force, recursive, repair);
 
   mdr->internal_op_finish = cs;
   enqueue_scrub_work(mdr);
@@ -12778,15 +12806,17 @@ void MDCache::enqueue_scrub(
 
 void MDCache::enqueue_scrub_work(MDRequestRef& mdr)
 {
-  CInode *in = mds->server->rdlock_path_pin_ref(mdr, true);
-  if (NULL == in)
+  CInode *in;
+  CF_MDS_RetryRequestFactory cf(this, mdr, true);
+  int r = path_traverse(mdr, cf, mdr->get_filepath(),
+			MDS_TRAVERSE_DISCOVER | MDS_TRAVERSE_RDLOCK_PATH,
+			nullptr, &in);
+  if (r > 0)
     return;
-
-  // TODO: Remove this restriction
-  ceph_assert(in->is_auth());
-
-  C_MDS_EnqueueScrub *cs = static_cast<C_MDS_EnqueueScrub*>(mdr->internal_op_finish);
-  ScrubHeaderRef header = cs->header;
+  if (r < 0) {
+    mds->server->respond_to_request(mdr, r);
+    return;
+  }
 
   // Cannot scrub same dentry twice at same time
   if (in->scrub_is_in_progress()) {
@@ -12796,53 +12826,12 @@ void MDCache::enqueue_scrub_work(MDRequestRef& mdr)
     in->scrub_info();
   }
 
-  header->set_origin(in);
+  C_MDS_EnqueueScrub *cs = static_cast<C_MDS_EnqueueScrub*>(mdr->internal_op_finish);
+  ScrubHeaderRef& header = cs->header;
 
-  Context *fin = nullptr;
-  if (!header->get_recursive())
-    fin = cs->take_finisher();
+  r = mds->scrubstack->enqueue(in, header, !header->get_recursive());
 
-  // If the scrub did some repair, then flush the journal at the end of
-  // the scrub.  Otherwise in the case of e.g. rewriting a backtrace
-  // the on disk state will still look damaged.
-  auto scrub_finish = new LambdaContext([this, header, fin](int r){
-    if (!header->get_repaired()) {
-      if (fin)
-        fin->complete(r);
-      return;
-    }
-
-    auto flush_finish = new LambdaContext([this, fin](int r){
-      dout(4) << "Expiring log segments because scrub did some repairs" << dendl;
-      mds->mdlog->trim_all();
-
-      if (fin) {
-	MDSGatherBuilder gather(g_ceph_context);
-	auto& expiring_segments = mds->mdlog->get_expiring_segments();
-	for (auto logseg : expiring_segments)
-	  logseg->wait_for_expiry(gather.new_sub());
-	ceph_assert(gather.has_subs());
-	gather.set_finisher(new MDSInternalContextWrapper(mds, fin));
-	gather.activate();
-      }
-    });
-
-    dout(4) << "Flushing journal because scrub did some repairs" << dendl;
-    mds->mdlog->start_new_segment();
-    mds->mdlog->flush();
-    mds->mdlog->wait_for_safe(new MDSInternalContextWrapper(mds, flush_finish));
-  });
-
-  if (!header->get_recursive()) {
-    mds->scrubstack->enqueue_inode_top(in, header,
-				       new MDSInternalContextWrapper(mds, scrub_finish));
-  } else {
-    mds->scrubstack->enqueue_inode_bottom(in, header, 
-				       new MDSInternalContextWrapper(mds, scrub_finish));
-  }
-
-  mds->server->respond_to_request(mdr, 0);
-  return;
+  mds->server->respond_to_request(mdr, r);
 }
 
 struct C_MDC_RespondInternalRequest : public MDCacheLogContext {
@@ -12855,12 +12844,27 @@ struct C_MDC_RespondInternalRequest : public MDCacheLogContext {
   }
 };
 
+struct C_MDC_ScrubRepaired : public MDCacheContext {
+  ScrubHeaderRef header;
+public:
+  C_MDC_ScrubRepaired(MDCache *m, const ScrubHeaderRef& h)
+    : MDCacheContext(m), header(h) {
+    header->inc_num_pending();
+  }
+  void finish(int r) override {
+    header->dec_num_pending();
+  }
+};
+
 void MDCache::repair_dirfrag_stats(CDir *dir)
 {
   MDRequestRef mdr = request_start_internal(CEPH_MDS_OP_REPAIR_FRAGSTATS);
   mdr->pin(dir);
   mdr->internal_op_private = dir;
-  mdr->internal_op_finish = new C_MDSInternalNoop;
+  if (dir->scrub_is_in_progress())
+    mdr->internal_op_finish = new C_MDC_ScrubRepaired(this, dir->get_scrub_header());
+  else
+    mdr->internal_op_finish = new C_MDSInternalNoop;
   repair_dirfrag_stats_work(mdr);
 }
 
@@ -12963,9 +12967,12 @@ void MDCache::repair_dirfrag_stats_work(MDRequestRef& mdr)
 void MDCache::repair_inode_stats(CInode *diri)
 {
   MDRequestRef mdr = request_start_internal(CEPH_MDS_OP_REPAIR_INODESTATS);
-  mdr->pin(diri);
+  mdr->auth_pin(diri); // already auth pinned by CInode::validate_disk_state()
   mdr->internal_op_private = diri;
-  mdr->internal_op_finish = new C_MDSInternalNoop;
+  if (diri->scrub_is_in_progress())
+    mdr->internal_op_finish = new C_MDC_ScrubRepaired(this, diri->get_scrub_header());
+  else
+    mdr->internal_op_finish = new C_MDSInternalNoop;
   repair_inode_stats_work(mdr);
 }
 
@@ -13058,6 +13065,40 @@ do_rdlocks:
   }
 
   mds->server->respond_to_request(mdr, 0);
+}
+
+void MDCache::rdlock_dirfrags_stats(CInode *diri, MDSInternalContext* fin)
+{
+  MDRequestRef mdr = request_start_internal(CEPH_MDS_OP_RDLOCK_FRAGSSTATS);
+  mdr->auth_pin(diri); // already auth pinned by CInode::validate_disk_state()
+  mdr->internal_op_private = diri;
+  mdr->internal_op_finish = fin;
+  return rdlock_dirfrags_stats_work(mdr);
+}
+
+void MDCache::rdlock_dirfrags_stats_work(MDRequestRef& mdr)
+{
+  CInode *diri = static_cast<CInode*>(mdr->internal_op_private);
+  dout(10) << __func__ << " " << *diri << dendl;
+  if (!diri->is_auth()) {
+    mds->server->respond_to_request(mdr, -ESTALE);
+    return;
+  }
+  if (!diri->is_dir()) {
+    mds->server->respond_to_request(mdr, -ENOTDIR);
+    return;
+  }
+
+  MutationImpl::LockOpVec lov;
+  lov.add_rdlock(&diri->dirfragtreelock);
+  lov.add_rdlock(&diri->nestlock);
+  lov.add_rdlock(&diri->filelock);
+  if (!mds->locker->acquire_locks(mdr, lov))
+    return;
+  dout(10) << __func__ << " start dirfrags : " << *diri << dendl;
+
+  mds->server->respond_to_request(mdr, 0);
+  return;
 }
 
 void MDCache::flush_dentry(std::string_view path, Context *fin)

@@ -34,6 +34,10 @@ using TCachedExtentRef = boost::intrusive_ptr<T>;
 /**
  * CachedExtent
  */
+namespace onode {
+  class DummyNodeExtent;
+  class TestReplayExtent;
+}
 class ExtentIndex;
 class CachedExtent : public boost::intrusive_ref_counter<
   CachedExtent, boost::thread_unsafe_counter> {
@@ -47,6 +51,9 @@ class CachedExtent : public boost::intrusive_ref_counter<
     INVALID                // Part of no ExtentIndex set
   } state = extent_state_t::INVALID;
   friend std::ostream &operator<<(std::ostream &, extent_state_t);
+  // allow a dummy extent to pretend it is at a specific state
+  friend class onode::DummyNodeExtent;
+  friend class onode::TestReplayExtent;
 
   uint32_t last_committed_crc = 0;
 

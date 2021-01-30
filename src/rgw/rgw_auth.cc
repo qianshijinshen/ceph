@@ -55,7 +55,7 @@ transform_old_authinfo(CephContext* const cct,
     }
 
     uint32_t get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const override {
-      return rgw_perms_from_aclspec_default_strategy(id, aclspec);
+      return rgw_perms_from_aclspec_default_strategy(id, aclspec, dpp);
     }
 
     bool is_admin_of(const rgw_user& acct_id) const override {
@@ -130,17 +130,18 @@ transform_old_authinfo(const req_state* const s)
 
 uint32_t rgw_perms_from_aclspec_default_strategy(
   const rgw_user& uid,
-  const rgw::auth::Identity::aclspec_t& aclspec)
+  const rgw::auth::Identity::aclspec_t& aclspec,
+  const DoutPrefixProvider *dpp)
 {
-  dout(5) << "Searching permissions for uid=" << uid <<  dendl;
+  ldpp_dout(dpp, 5) << "Searching permissions for uid=" << uid <<  dendl;
 
   const auto iter = aclspec.find(uid.to_str());
   if (std::end(aclspec) != iter) {
-    dout(5) << "Found permission: " << iter->second << dendl;
+    ldpp_dout(dpp, 5) << "Found permission: " << iter->second << dendl;
     return iter->second;
   }
 
-  dout(5) << "Permissions for user not found" << dendl;
+  ldpp_dout(dpp, 5) << "Permissions for user not found" << dendl;
   return 0;
 }
 
@@ -227,7 +228,7 @@ strategy_handle_granted(rgw::auth::Engine::result_t&& engine_result,
 }
 
 rgw::auth::Engine::result_t
-rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state* const s) const
+rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state* const s, optional_yield y) const
 {
   result_t strategy_result = result_t::deny();
 
@@ -239,7 +240,7 @@ rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state
 
     result_t engine_result = result_t::deny();
     try {
-      engine_result = engine.authenticate(dpp, s);
+      engine_result = engine.authenticate(dpp, s, y);
     } catch (const int err) {
       engine_result = result_t::deny(err);
     }
@@ -287,10 +288,10 @@ rgw::auth::Strategy::authenticate(const DoutPrefixProvider* dpp, const req_state
 
 int
 rgw::auth::Strategy::apply(const DoutPrefixProvider *dpp, const rgw::auth::Strategy& auth_strategy,
-                           req_state* const s) noexcept
+                           req_state* const s, optional_yield y) noexcept
 {
   try {
-    auto result = auth_strategy.authenticate(dpp, s);
+    auto result = auth_strategy.authenticate(dpp, s, y);
     if (result.get_status() != decltype(result)::Status::GRANTED) {
       /* Access denied is acknowledged by returning a std::unique_ptr with
        * nullptr inside. */
@@ -323,10 +324,17 @@ rgw::auth::Strategy::apply(const DoutPrefixProvider *dpp, const rgw::auth::Strat
     } catch (const int err) {
       ldpp_dout(dpp, 5) << "applier throwed err=" << err << dendl;
       return err;
+    } catch (const std::exception& e) {
+      ldpp_dout(dpp, 5) << "applier throwed unexpected err: " << e.what()
+                        << dendl;
+      return -EPERM;
     }
   } catch (const int err) {
     ldpp_dout(dpp, 5) << "auth engine throwed err=" << err << dendl;
     return err;
+  } catch (const std::exception& e) {
+    ldpp_dout(dpp, 5) << "auth engine throwed unexpected err: " << e.what()
+                      << dendl;
   }
 
   /* We never should be here. */
@@ -369,7 +377,7 @@ void rgw::auth::WebIdentityApplier::create_account(const DoutPrefixProvider* dpp
   rgw_apply_default_bucket_quota(user_info.bucket_quota, cct->_conf);
   rgw_apply_default_user_quota(user_info.user_quota, cct->_conf);
 
-  int ret = ctl->user->store_info(user_info, null_yield,
+  int ret = ctl->user->store_info(dpp, user_info, null_yield,
                                   RGWUserCtl::PutParams().set_exclusive(true));
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to store new user info: user="
@@ -384,9 +392,34 @@ void rgw::auth::WebIdentityApplier::load_acct_info(const DoutPrefixProvider* dpp
   federated_user.tenant = role_tenant;
   federated_user.ns = "oidc";
 
-  if (ctl->user->get_info_by_uid(federated_user, &user_info, null_yield) >= 0) {
+  //Check in oidc namespace
+  if (ctl->user->get_info_by_uid(dpp, federated_user, &user_info, null_yield) >= 0) {
     /* Succeeded. */
     return;
+  }
+
+  federated_user.ns.clear();
+  //Check for old users which wouldn't have been created in oidc namespace
+  if (ctl->user->get_info_by_uid(dpp, federated_user, &user_info, null_yield) >= 0) {
+    /* Succeeded. */
+    return;
+  }
+
+  //Check if user_id.buckets already exists, may have been from the time, when shadow users didnt exist
+  RGWStorageStats stats;
+  int ret = ctl->user->read_stats(federated_user, &stats, null_yield);
+  if (ret < 0 && ret != -ENOENT) {
+    ldpp_dout(dpp, 0) << "ERROR: reading stats for the user returned error " << ret << dendl;
+    return;
+  }
+  if (ret == -ENOENT) { /* in case of ENOENT, which means user doesnt have buckets */
+    //In this case user will be created in oidc namespace
+    ldpp_dout(dpp, 5) << "NOTICE: incoming user has no buckets " << federated_user << dendl;
+    federated_user.ns = "oidc";
+  } else {
+    //User already has buckets associated, hence wont be created in oidc namespace.
+    ldpp_dout(dpp, 5) << "NOTICE: incoming user already has buckets associated " << federated_user << ", won't be created in oidc namespace"<< dendl;
+    federated_user.ns = "";
   }
 
   ldpp_dout(dpp, 0) << "NOTICE: couldn't map oidc federated user " << federated_user << dendl;
@@ -432,7 +465,7 @@ uint32_t rgw::auth::RemoteApplier::get_perms_from_aclspec(const DoutPrefixProvid
 
   /* For backward compatibility with ACLOwner. */
   perm |= rgw_perms_from_aclspec_default_strategy(info.acct_user,
-                                                  aclspec);
+                                                  aclspec, dpp);
 
   /* We also need to cover cases where rgw_keystone_implicit_tenants
    * was enabled. */
@@ -440,7 +473,7 @@ uint32_t rgw::auth::RemoteApplier::get_perms_from_aclspec(const DoutPrefixProvid
     const rgw_user tenanted_acct_user(info.acct_user.id, info.acct_user.id);
 
     perm |= rgw_perms_from_aclspec_default_strategy(tenanted_acct_user,
-                                                    aclspec);
+                                                    aclspec, dpp);
   }
 
   /* Now it's a time for invoking additional strategy that was supplied by
@@ -567,7 +600,7 @@ void rgw::auth::RemoteApplier::create_account(const DoutPrefixProvider* dpp,
   rgw_apply_default_bucket_quota(user_info.bucket_quota, cct->_conf);
   rgw_apply_default_user_quota(user_info.user_quota, cct->_conf);
 
-  int ret = ctl->user->store_info(user_info, null_yield,
+  int ret = ctl->user->store_info(dpp, user_info, null_yield,
                                   RGWUserCtl::PutParams().set_exclusive(true));
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to store new user info: user="
@@ -609,7 +642,7 @@ void rgw::auth::RemoteApplier::load_acct_info(const DoutPrefixProvider* dpp, RGW
   else if (acct_user.tenant.empty()) {
     const rgw_user tenanted_uid(acct_user.id, acct_user.id);
 
-    if (ctl->user->get_info_by_uid(tenanted_uid, &user_info, null_yield) >= 0) {
+    if (ctl->user->get_info_by_uid(dpp, tenanted_uid, &user_info, null_yield) >= 0) {
       /* Succeeded. */
       return;
     }
@@ -617,7 +650,7 @@ void rgw::auth::RemoteApplier::load_acct_info(const DoutPrefixProvider* dpp, RGW
 
   if (split_mode && implicit_tenant)
 	;	/* suppress lookup for id used by "other" protocol */
-  else if (ctl->user->get_info_by_uid(acct_user, &user_info, null_yield) >= 0) {
+  else if (ctl->user->get_info_by_uid(dpp, acct_user, &user_info, null_yield) >= 0) {
       /* Succeeded. */
       return;
   }
@@ -634,7 +667,7 @@ const std::string rgw::auth::LocalApplier::NO_SUBUSER;
 
 uint32_t rgw::auth::LocalApplier::get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const
 {
-  return rgw_perms_from_aclspec_default_strategy(user_info.user_id, aclspec);
+  return rgw_perms_from_aclspec_default_strategy(user_info.user_id, aclspec, dpp);
 }
 
 bool rgw::auth::LocalApplier::is_admin_of(const rgw_user& uid) const
@@ -795,7 +828,7 @@ void rgw::auth::RoleApplier::modify_request_state(const DoutPrefixProvider *dpp,
 }
 
 rgw::auth::Engine::result_t
-rgw::auth::AnonymousEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s) const
+rgw::auth::AnonymousEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s, optional_yield y) const
 {
   if (! is_applicable(s)) {
     return result_t::deny(-EPERM);

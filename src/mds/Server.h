@@ -79,6 +79,7 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
+  l_mdss_cap_acquisition_throttle,
   l_mdss_last,
 };
 
@@ -288,7 +289,8 @@ public:
   bool _need_force_journal(CInode *diri, bool empty);
   void _rename_prepare(MDRequestRef& mdr,
 		       EMetaBlob *metablob, bufferlist *client_map_bl,
-		       CDentry *srcdn, CDentry *destdn, CDentry *straydn);
+		       CDentry *srcdn, CDentry *destdn, std::string_view alternate_name,
+                       CDentry *straydn);
   /* set not_journaling=true if you're going to discard the results --
    * this bypasses the asserts to make sure we're journaling the right
    * things on the right nodes */
@@ -460,6 +462,14 @@ private:
   time last_recall_state;
 
   MetricsHandler *metrics_handler;
+
+  // Cache cap acquisition throttle configs
+  uint64_t max_caps_per_client;
+  uint64_t cap_acquisition_throttle;
+  double max_caps_throttle_ratio;
+  double caps_throttle_retry_request_timeout;
+
+  size_t alternate_name_max = g_conf().get_val<Option::size_t>("mds_alternate_name_max");
 };
 
 static inline constexpr auto operator|(Server::RecallFlags a, Server::RecallFlags b) {

@@ -90,6 +90,7 @@ public:
   void sub_unwant(const std::string& what);
   bool sub_want_increment(const std::string& what, version_t start, unsigned flags);
   seastar::future<> renew_subs();
+  seastar::future<> wait_for_config();
 
   void print(std::ostream&) const;
 private:
@@ -140,13 +141,13 @@ private:
 private:
   void tick();
 
-  seastar::future<> ms_dispatch(crimson::net::Connection* conn,
-				MessageRef m) override;
+  std::optional<seastar::future<>> ms_dispatch(crimson::net::ConnectionRef conn,
+                                               MessageRef m) override;
   void ms_handle_reset(crimson::net::ConnectionRef conn, bool is_replace) override;
 
-  seastar::future<> handle_monmap(crimson::net::Connection* conn,
+  seastar::future<> handle_monmap(crimson::net::ConnectionRef conn,
 				  Ref<MMonMap> m);
-  seastar::future<> handle_auth_reply(crimson::net::Connection* conn,
+  seastar::future<> handle_auth_reply(crimson::net::ConnectionRef conn,
 				      Ref<MAuthReply> m);
   seastar::future<> handle_subscribe_ack(Ref<MMonSubscribeAck> m);
   seastar::future<> handle_get_version_reply(Ref<MMonGetVersionReply> m);
@@ -173,6 +174,7 @@ private:
     seastar::promise<> pr;
   };
   std::deque<pending_msg_t> pending_messages;
+  std::optional<seastar::promise<>> config_updated;
 };
 
 inline std::ostream& operator<<(std::ostream& out, const Client& client) {

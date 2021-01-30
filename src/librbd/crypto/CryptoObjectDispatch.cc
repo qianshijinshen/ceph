@@ -67,18 +67,19 @@ struct C_AlignedObjectReadRequest : public Context {
     }
 
     void finish(int r) override {
+      ldout(image_ctx->cct, 20) << "aligned read r=" << r << dendl;
       on_finish->complete(r);
     }
 
     void handle_read(int r) {
       auto cct = image_ctx->cct;
-      ldout(cct, 20) << "r=" << r << dendl;
+      ldout(cct, 20) << "aligned read r=" << r << dendl;
       if (r == 0) {
         for (auto& extent: *extents) {
           auto crypto_ret = crypto->decrypt_aligned_extent(
                   extent,
-                  Striper::get_file_offset(
-                          cct, &image_ctx->layout, object_no, extent.offset));
+                  io::util::get_file_offset(
+                          image_ctx, object_no, extent.offset));
           if (crypto_ret != 0) {
             ceph_assert(crypto_ret < 0);
             r = crypto_ret;
@@ -118,9 +119,10 @@ struct C_UnalignedObjectReadRequest : public Context {
 
       // send the aligned read back to get decrypted
       req = io::ObjectDispatchSpec::create_read(
-              image_ctx, io::OBJECT_DISPATCH_LAYER_NONE, object_no,
-              &aligned_extents, io_context, op_flags, read_flags, parent_trace,
-              version, this);
+              image_ctx,
+              io::util::get_previous_layer(io::OBJECT_DISPATCH_LAYER_CRYPTO),
+              object_no, &aligned_extents, io_context, op_flags, read_flags,
+              parent_trace, version, this);
     }
 
     void send() {
@@ -132,8 +134,13 @@ struct C_UnalignedObjectReadRequest : public Context {
         auto& extent = (*extents)[i];
         auto& aligned_extent = aligned_extents[i];
         if (aligned_extent.extent_map.empty()) {
-          aligned_extent.bl.splice(extent.offset - aligned_extent.offset,
-                                   extent.length, &extent.bl);
+          uint64_t cut_offset = extent.offset - aligned_extent.offset;
+          int64_t padding_count =
+                  cut_offset + extent.length - aligned_extent.bl.length();
+          if (padding_count > 0) {
+            aligned_extent.bl.append_zero(padding_count);
+          }
+          aligned_extent.bl.splice(cut_offset, extent.length, &extent.bl);
         } else {
           for (auto [off, len]: aligned_extent.extent_map) {
             ceph::bufferlist tmp;
@@ -164,7 +171,7 @@ struct C_UnalignedObjectReadRequest : public Context {
     }
 
     void finish(int r) override {
-      ldout(cct, 20) << "r=" << r << dendl;
+      ldout(cct, 20) << "unaligned read r=" << r << dendl;
       if (r >= 0) {
         remove_alignment_data();
 
@@ -194,6 +201,7 @@ struct C_UnalignedObjectWriteRequest : public Context {
     int* object_dispatch_flags;
     uint64_t* journal_tid;
     Context* on_finish;
+    bool may_copyup;
     ceph::bufferlist aligned_data;
     io::ReadExtents extents;
     uint64_t version;
@@ -207,14 +215,15 @@ struct C_UnalignedObjectWriteRequest : public Context {
             IOContext io_context, int op_flags, int write_flags,
             std::optional<uint64_t> assert_version,
             const ZTracer::Trace &parent_trace, int* object_dispatch_flags,
-            uint64_t* journal_tid,Context* on_dispatched
+            uint64_t* journal_tid, Context* on_dispatched, bool may_copyup
             ) : image_ctx(image_ctx), crypto(crypto), object_no(object_no),
                 object_off(object_off), data(data), cmp_data(cmp_data),
                 mismatch_offset(mismatch_offset), io_context(io_context),
                 op_flags(op_flags), write_flags(write_flags),
                 assert_version(assert_version), parent_trace(parent_trace),
                 object_dispatch_flags(object_dispatch_flags),
-                journal_tid(journal_tid), on_finish(on_dispatched) {
+                journal_tid(journal_tid), on_finish(on_dispatched),
+                may_copyup(may_copyup) {
       // build read extents
       auto [pre_align, post_align] = crypto->get_pre_and_post_align(
               object_off, data.length());
@@ -234,7 +243,8 @@ struct C_UnalignedObjectWriteRequest : public Context {
 
       read_req = new C_UnalignedObjectReadRequest<I>(
               image_ctx, crypto, object_no, &extents, io_context,
-              0, 0, parent_trace, &version, 0, ctx);
+              0, io::READ_FLAG_DISABLE_READ_FROM_PARENT, parent_trace,
+              &version, 0, ctx);
     }
 
     void send() {
@@ -324,10 +334,29 @@ struct C_UnalignedObjectWriteRequest : public Context {
       }
     }
 
-    void handle_read(int r) {
+    void handle_copyup(int r) {
       ldout(image_ctx->cct, 20) << "r=" << r << dendl;
+      if (r < 0) {
+        complete(r);
+      } else {
+        restart_request(false);
+      }
+    }
+
+    void handle_read(int r) {
+      ldout(image_ctx->cct, 20) << "unaligned write r=" << r << dendl;
 
       if (r == -ENOENT) {
+        if (may_copyup) {
+          auto ctx = create_context_callback<
+                  C_UnalignedObjectWriteRequest<I>,
+                  &C_UnalignedObjectWriteRequest<I>::handle_copyup>(this);
+          if (io::util::trigger_copyup(
+                  image_ctx, object_no, io_context, ctx)) {
+            return;
+          }
+          delete ctx;
+        }
         object_exists = false;
       } else if (r < 0) {
         complete(r);
@@ -356,14 +385,26 @@ struct C_UnalignedObjectWriteRequest : public Context {
 
       // send back aligned write back to get encrypted and committed
       auto write_req = io::ObjectDispatchSpec::create_write(
-              image_ctx, io::OBJECT_DISPATCH_LAYER_NONE, object_no,
-              aligned_off, std::move(aligned_data), io_context, op_flags,
-              new_write_flags, new_assert_version,
+              image_ctx,
+              io::util::get_previous_layer(io::OBJECT_DISPATCH_LAYER_CRYPTO),
+              object_no, aligned_off, std::move(aligned_data), io_context,
+              op_flags, new_write_flags, new_assert_version,
               journal_tid == nullptr ? 0 : *journal_tid, parent_trace, ctx);
       write_req->send();
     }
 
+    void restart_request(bool may_copyup) {
+      auto req = new C_UnalignedObjectWriteRequest<I>(
+              image_ctx, crypto, object_no, object_off,
+              std::move(data), std::move(cmp_data),
+              mismatch_offset, io_context, op_flags, write_flags,
+              assert_version, parent_trace,
+              object_dispatch_flags, journal_tid, this, may_copyup);
+      req->send();
+    }
+
     void handle_write(int r) {
+      ldout(image_ctx->cct, 20) << "r=" << r << dendl;
       bool exclusive = write_flags & io::OBJECT_WRITE_FLAG_CREATE_EXCLUSIVE;
       bool restart = false;
       if (r == -ERANGE && !assert_version.has_value()) {
@@ -373,19 +414,14 @@ struct C_UnalignedObjectWriteRequest : public Context {
       }
 
       if (restart) {
-        auto req = new C_UnalignedObjectWriteRequest<I>(
-                image_ctx, crypto, object_no, object_off,
-                std::move(data), std::move(cmp_data),
-                mismatch_offset, io_context, op_flags, write_flags,
-                assert_version, parent_trace,
-                object_dispatch_flags, journal_tid, this);
-        req->send();
+        restart_request(may_copyup);
       } else {
         complete(r);
       }
     }
 
     void finish(int r) override {
+      ldout(image_ctx->cct, 20) << "unaligned write r=" << r << dendl;
       on_finish->complete(r);
     }
 };
@@ -394,18 +430,6 @@ template <typename I>
 CryptoObjectDispatch<I>::CryptoObjectDispatch(
     I* image_ctx, ceph::ref_t<CryptoInterface> crypto)
   : m_image_ctx(image_ctx), m_crypto(crypto) {
-}
-
-template <typename I>
-void CryptoObjectDispatch<I>::init(Context* on_finish) {
-  auto cct = m_image_ctx->cct;
-  ldout(cct, 5) << dendl;
-
-  // need to initialize m_crypto here using image header object
-
-  m_image_ctx->io_object_dispatcher->register_dispatch(this);
-
-  on_finish->complete(0);
 }
 
 template <typename I>
@@ -463,9 +487,7 @@ bool CryptoObjectDispatch<I>::write(
   if (m_crypto->is_aligned(object_off, data.length())) {
     auto r = m_crypto->encrypt(
             &data,
-            Striper::get_file_offset(
-                    m_image_ctx->cct, &m_image_ctx->layout, object_no,
-                    object_off));
+            io::util::get_file_offset(m_image_ctx, object_no, object_off));
     *dispatch_result = r == 0 ? io::DISPATCH_RESULT_CONTINUE
                               : io::DISPATCH_RESULT_COMPLETE;
     on_dispatched->complete(r);
@@ -474,7 +496,8 @@ bool CryptoObjectDispatch<I>::write(
     auto req = new C_UnalignedObjectWriteRequest<I>(
             m_image_ctx, m_crypto, object_no, object_off, std::move(data), {},
             nullptr, io_context, op_flags, write_flags, assert_version,
-            parent_trace, object_dispatch_flags, journal_tid, on_dispatched);
+            parent_trace, object_dispatch_flags, journal_tid, on_dispatched,
+            true);
     req->send();
   }
 
@@ -508,9 +531,10 @@ bool CryptoObjectDispatch<I>::write_same(
 
   *dispatch_result = io::DISPATCH_RESULT_COMPLETE;
   auto req = io::ObjectDispatchSpec::create_write(
-          m_image_ctx, io::OBJECT_DISPATCH_LAYER_NONE, object_no,
-          object_off, std::move(ws_data), io_context, op_flags, 0, std::nullopt,
-          0, parent_trace, ctx);
+          m_image_ctx,
+          io::util::get_previous_layer(io::OBJECT_DISPATCH_LAYER_CRYPTO),
+          object_no, object_off, std::move(ws_data), io_context, op_flags, 0,
+          std::nullopt, 0, parent_trace, ctx);
   req->send();
   return true;
 }
@@ -534,7 +558,7 @@ bool CryptoObjectDispatch<I>::compare_and_write(
           m_image_ctx, m_crypto, object_no, object_off, std::move(write_data),
           std::move(cmp_data), mismatch_offset, io_context, op_flags, 0,
           std::nullopt, parent_trace, object_dispatch_flags, journal_tid,
-          on_dispatched);
+          on_dispatched, true);
   req->send();
 
   return true;
@@ -564,11 +588,71 @@ bool CryptoObjectDispatch<I>::discard(
 
   *dispatch_result = io::DISPATCH_RESULT_COMPLETE;
   auto req = io::ObjectDispatchSpec::create_write_same(
-          m_image_ctx, io::OBJECT_DISPATCH_LAYER_NONE, object_no, object_off,
-          object_len, {{0, buffer_size}}, std::move(bl), io_context,
-          *object_dispatch_flags, 0, parent_trace, ctx);
+          m_image_ctx,
+          io::util::get_previous_layer(io::OBJECT_DISPATCH_LAYER_CRYPTO),
+          object_no, object_off, object_len, {{0, object_len}}, std::move(bl),
+          io_context, *object_dispatch_flags, 0, parent_trace, ctx);
   req->send();
   return true;
+}
+
+template <typename I>
+int CryptoObjectDispatch<I>::prepare_copyup(
+        uint64_t object_no,
+        io::SnapshotSparseBufferlist* snapshot_sparse_bufferlist) {
+  ceph::bufferlist current_bl;
+  current_bl.append_zero(m_image_ctx->get_object_size());
+
+  for (auto& [key, extent_map]: *snapshot_sparse_bufferlist) {
+    // update current_bl with data from extent_map
+    for (auto& extent : extent_map) {
+      auto &sbe = extent.get_val();
+      if (sbe.state == io::SPARSE_EXTENT_STATE_DATA) {
+        current_bl.begin(extent.get_off()).copy_in(extent.get_len(), sbe.bl);
+      } else if (sbe.state == io::SPARSE_EXTENT_STATE_ZEROED) {
+        ceph::bufferlist zeros;
+        zeros.append_zero(extent.get_len());
+        current_bl.begin(extent.get_off()).copy_in(extent.get_len(), zeros);
+      }
+    }
+
+    // encrypt
+    io::SparseBufferlist encrypted_sparse_bufferlist;
+    for (auto& extent : extent_map) {
+      auto [aligned_off, aligned_len] = m_crypto->align(
+              extent.get_off(), extent.get_len());
+
+      io::Extents image_extents;
+      io::util::extent_to_file(
+              m_image_ctx, object_no, aligned_off, aligned_len, image_extents);
+
+      ceph::bufferlist encrypted_bl;
+      uint64_t position = 0;
+      for (auto [image_offset, image_length]: image_extents) {
+        ceph::bufferlist aligned_bl;
+        aligned_bl.substr_of(current_bl, aligned_off + position, image_length);
+        aligned_bl.rebuild(); // to deep copy aligned_bl from current_bl
+        position += image_length;
+
+        auto r = m_crypto->encrypt(&aligned_bl, image_offset);
+        if (r != 0) {
+          return r;
+        }
+
+        encrypted_bl.append(aligned_bl);
+      }
+
+      encrypted_sparse_bufferlist.insert(
+        aligned_off, aligned_len, {io::SPARSE_EXTENT_STATE_DATA, aligned_len,
+                                   std::move(encrypted_bl)});
+    }
+
+    // replace original plaintext sparse bufferlist with encrypted one
+    extent_map.clear();
+    extent_map.insert(std::move(encrypted_sparse_bufferlist));
+  }
+
+  return 0;
 }
 
 } // namespace crypto

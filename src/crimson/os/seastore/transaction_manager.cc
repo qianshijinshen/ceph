@@ -168,6 +168,23 @@ TransactionManager::ref_ret TransactionManager::dec_ref(
   });
 }
 
+TransactionManager::refs_ret TransactionManager::dec_ref(
+  Transaction &t,
+  std::vector<laddr_t> offsets)
+{
+  return seastar::do_with(std::move(offsets), std::vector<unsigned>(),
+      [this, &t] (auto &&offsets, auto &refcnt) {
+      return crimson::do_for_each(offsets.begin(), offsets.end(),
+        [this, &t, &refcnt] (auto &laddr) {
+        return dec_ref(t, laddr).safe_then([&refcnt] (auto ref) {
+          refcnt.push_back(ref);
+        });
+      }).safe_then([&refcnt] {
+        return ref_ertr::make_ready_future<std::vector<unsigned>>(std::move(refcnt));
+      });
+    });
+}
+
 TransactionManager::submit_transaction_ertr::future<>
 TransactionManager::submit_transaction(
   TransactionRef t)
@@ -272,7 +289,7 @@ TransactionManager::get_extent_if_live_ret TransactionManager::get_extent_if_liv
 	    addr,
 	    laddr,
 	    len).safe_then(
-	      [this, &t, pin=std::move(pin)](CachedExtentRef ret) mutable {
+	      [this, pin=std::move(pin)](CachedExtentRef ret) mutable {
 		auto lref = ret->cast<LogicalCachedExtent>();
 		if (!lref->has_pin()) {
 		  lref->set_pin(std::move(pin));

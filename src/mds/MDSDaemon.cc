@@ -462,25 +462,36 @@ void MDSDaemon::clean_up_admin_socket()
 
 int MDSDaemon::init()
 {
+#ifdef _WIN32
+  // Some file related flags and types are stubbed on Windows. In order to avoid
+  // incorrect behavior, we're going to prevent the MDS from running on Windows
+  // until those limitations are addressed. MDS clients, however, are allowed
+  // to run on Windows.
+  derr << "The Ceph MDS does not support running on Windows at the moment."
+       << dendl;
+  return -ENOSYS;
+#endif // _WIN32
+
+  dout(10) << "Dumping misc struct sizes:" << dendl;
   dout(10) << sizeof(MDSCacheObject) << "\tMDSCacheObject" << dendl;
   dout(10) << sizeof(CInode) << "\tCInode" << dendl;
-  dout(10) << sizeof(elist<void*>::item) << "\t elist<>::item   *7=" << 7*sizeof(elist<void*>::item) << dendl;
-  dout(10) << sizeof(CInode::mempool_inode) << "\t inode  " << dendl;
-  dout(10) << sizeof(CInode::mempool_old_inode) << "\t old_inode " << dendl;
-  dout(10) << sizeof(nest_info_t) << "\t  nest_info_t " << dendl;
-  dout(10) << sizeof(frag_info_t) << "\t  frag_info_t " << dendl;
-  dout(10) << sizeof(SimpleLock) << "\t SimpleLock   *5=" << 5*sizeof(SimpleLock) << dendl;
-  dout(10) << sizeof(ScatterLock) << "\t ScatterLock  *3=" << 3*sizeof(ScatterLock) << dendl;
+  dout(10) << sizeof(elist<void*>::item) << "\telist<>::item" << dendl;
+  dout(10) << sizeof(CInode::mempool_inode) << "\tinode" << dendl;
+  dout(10) << sizeof(CInode::mempool_old_inode) << "\told_inode" << dendl;
+  dout(10) << sizeof(nest_info_t) << "\tnest_info_t" << dendl;
+  dout(10) << sizeof(frag_info_t) << "\tfrag_info_t" << dendl;
+  dout(10) << sizeof(SimpleLock) << "\tSimpleLock" << dendl;
+  dout(10) << sizeof(ScatterLock) << "\tScatterLock" << dendl;
   dout(10) << sizeof(CDentry) << "\tCDentry" << dendl;
-  dout(10) << sizeof(elist<void*>::item) << "\t elist<>::item" << dendl;
-  dout(10) << sizeof(SimpleLock) << "\t SimpleLock" << dendl;
-  dout(10) << sizeof(CDir) << "\tCDir " << dendl;
-  dout(10) << sizeof(elist<void*>::item) << "\t elist<>::item   *2=" << 2*sizeof(elist<void*>::item) << dendl;
-  dout(10) << sizeof(fnode_t) << "\t fnode_t " << dendl;
-  dout(10) << sizeof(nest_info_t) << "\t  nest_info_t *2" << dendl;
-  dout(10) << sizeof(frag_info_t) << "\t  frag_info_t *2" << dendl;
-  dout(10) << sizeof(Capability) << "\tCapability " << dendl;
-  dout(10) << sizeof(xlist<void*>::item) << "\t xlist<>::item   *2=" << 2*sizeof(xlist<void*>::item) << dendl;
+  dout(10) << sizeof(elist<void*>::item) << "\telist<>::item" << dendl;
+  dout(10) << sizeof(SimpleLock) << "\tSimpleLock" << dendl;
+  dout(10) << sizeof(CDir) << "\tCDir" << dendl;
+  dout(10) << sizeof(elist<void*>::item) << "\telist<>::item" << dendl;
+  dout(10) << sizeof(fnode_t) << "\tfnode_t" << dendl;
+  dout(10) << sizeof(nest_info_t) << "\tnest_info_t" << dendl;
+  dout(10) << sizeof(frag_info_t) << "\tfrag_info_t" << dendl;
+  dout(10) << sizeof(Capability) << "\tCapability" << dendl;
+  dout(10) << sizeof(xlist<void*>::item) << "\txlist<>::item" << dendl;
 
   messenger->add_dispatcher_tail(&beacon);
   messenger->add_dispatcher_tail(this);

@@ -7,7 +7,6 @@ from shlex import split as shlex_split
 from io import StringIO
 
 from tasks.ceph_test_case import CephTestCase
-from tasks.cephfs.fuse_mount import FuseMount
 
 from teuthology import contextutil
 from teuthology.misc import sudo_write_file
@@ -81,6 +80,10 @@ class CephFSTestCase(CephTestCase):
     # requires REQUIRE_FILESYSTEM = True
     REQUIRE_RECOVERY_FILESYSTEM = False
 
+    # create a backup filesystem if required.
+    # required REQUIRE_FILESYSTEM enabled
+    REQUIRE_BACKUP_FILESYSTEM = False
+
     LOAD_SETTINGS = [] # type: ignore
 
     def _save_mount_details(self):
@@ -107,13 +110,6 @@ class CephFSTestCase(CephTestCase):
                 len(self.mounts), self.CLIENTS_REQUIRED
             ))
 
-        if self.REQUIRE_KCLIENT_REMOTE:
-            if not isinstance(self.mounts[0], FuseMount) or not isinstance(self.mounts[1], FuseMount):
-                # kclient kill() power cycles nodes, so requires clients to each be on
-                # their own node
-                if self.mounts[0].client_remote.hostname == self.mounts[1].client_remote.hostname:
-                    self.skipTest("kclient clients must be on separate nodes")
-
         if self.REQUIRE_ONE_CLIENT_REMOTE:
             if self.mounts[0].client_remote.hostname in self.mds_cluster.get_mds_hostnames():
                 self.skipTest("Require first client to be on separate server from MDSs")
@@ -135,6 +131,7 @@ class CephFSTestCase(CephTestCase):
         self.mds_cluster.delete_all_filesystems()
         self.mds_cluster.mds_restart() # to reset any run-time configs, etc.
         self.fs = None # is now invalid!
+        self.backup_fs = None
         self.recovery_fs = None
 
         # In case anything is in the OSD blocklist list, clear it out.  This is to avoid
@@ -154,7 +151,7 @@ class CephFSTestCase(CephTestCase):
         # test, delete them
         for entry in self.auth_list():
             ent_type, ent_id = entry['entity'].split(".")
-            if ent_type == "client" and ent_id not in client_mount_ids and ent_id != "admin":
+            if ent_type == "client" and ent_id not in client_mount_ids and not (ent_id == "admin" or ent_id[:6] == 'mirror'):
                 self.mds_cluster.mon_manager.raw_cluster_cmd("auth", "del", entry['entity'])
 
         if self.REQUIRE_FILESYSTEM:
@@ -180,9 +177,19 @@ class CephFSTestCase(CephTestCase):
             for i in range(0, self.CLIENTS_REQUIRED):
                 self.mounts[i].mount_wait()
 
+        if self.REQUIRE_BACKUP_FILESYSTEM:
+            if not self.REQUIRE_FILESYSTEM:
+                self.skipTest("backup filesystem requires a primary filesystem as well")
+            self.fs.mon_manager.raw_cluster_cmd('fs', 'flag', 'set',
+                                                'enable_multiple', 'true',
+                                                '--yes-i-really-mean-it')
+            self.backup_fs = self.mds_cluster.newfs(name="backup_fs")
+            self.backup_fs.wait_for_daemons()
+
         if self.REQUIRE_RECOVERY_FILESYSTEM:
             if not self.REQUIRE_FILESYSTEM:
                 self.skipTest("Recovery filesystem requires a primary filesystem as well")
+            # After Octopus is EOL, we can remove this setting:
             self.fs.mon_manager.raw_cluster_cmd('fs', 'flag', 'set',
                                                 'enable_multiple', 'true',
                                                 '--yes-i-really-mean-it')
@@ -259,6 +266,9 @@ class CephFSTestCase(CephTestCase):
 
     def _session_by_id(self, session_ls):
         return dict([(s['id'], s) for s in session_ls])
+
+    def perf_dump(self, rank=None, status=None):
+        return self.fs.rank_asok(['perf', 'dump'], rank=rank, status=status)
 
     def wait_until_evicted(self, client_id, timeout=30):
         def is_client_evicted():

@@ -34,7 +34,9 @@ std::string PyModule::config_prefix = "mgr/";
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 // Boost apparently can't be bothered to fix its own usage of its own
 // deprecated features.
-#include <boost/python.hpp>
+#include <boost/python/extract.hpp>
+#include <boost/python/import.hpp>
+#include <boost/python/object.hpp>
 #undef BOOST_BIND_GLOBAL_PLACEHOLDERS
 #include <boost/algorithm/string/predicate.hpp>
 #include "include/ceph_assert.h"  // boost clobbers this
@@ -497,12 +499,9 @@ int PyModule::load_commands()
     command.perm = PyUnicode_AsUTF8(pPerm);
 
     command.polling = false;
-    PyObject *pPoll = PyDict_GetItemString(pCommand, "poll");
-    if (pPoll) {
-      std::string polling = PyUnicode_AsUTF8(pPoll);
-      if (boost::iequals(polling, "true")) {
-        command.polling = true;
-      }
+    if (PyObject *pPoll = PyDict_GetItemString(pCommand, "poll");
+	pPoll && PyObject_IsTrue(pPoll)) {
+      command.polling = true;
     }
 
     command.module_name = module_name;

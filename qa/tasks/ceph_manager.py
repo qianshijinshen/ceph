@@ -13,6 +13,7 @@ import logging
 import threading
 import traceback
 import os
+import shlex
 
 from io import BytesIO, StringIO
 from subprocess import DEVNULL
@@ -226,14 +227,14 @@ class OSDThrasher(Thrasher):
         if self.ceph_manager.cephadm:
             return shell(
                 self.ceph_manager.ctx, self.ceph_manager.cluster, remote,
-                args=['ceph-objectstore-tool'] + cmd,
+                args=['ceph-objectstore-tool', '--err-to-stderr'] + cmd,
                 name=osd,
                 wait=True, check_status=False,
                 stdout=StringIO(),
                 stderr=StringIO())
         else:
             return remote.run(
-                args=['sudo', 'adjust-ulimits', 'ceph-objectstore-tool'] + cmd,
+                args=['sudo', 'adjust-ulimits', 'ceph-objectstore-tool', '--err-to-stderr'] + cmd,
                 wait=True, check_status=False,
                 stdout=StringIO(),
                 stderr=StringIO())
@@ -1326,6 +1327,17 @@ class CephManager:
             except CommandFailedError:
                 self.log('Failed to get pg_num from pool %s, ignoring' % pool)
 
+    def ceph(self, cmd, **kwargs):
+        """
+        Simple Ceph admin command wrapper around run_cluster_cmd.
+        """
+
+        kwargs.pop('args', None)
+        args = shlex.split(cmd)
+        stdout = kwargs.pop('stdout', StringIO())
+        stderr = kwargs.pop('stderr', StringIO())
+        return self.run_cluster_cmd(args=args, stdout=stdout, stderr=stderr, **kwargs)
+
     def run_cluster_cmd(self, **kwargs):
         """
         Run a Ceph command and return the object representing the process
@@ -1346,12 +1358,13 @@ class CephManager:
         kwargs['args'] = prefix + list(kwargs['args'])
         return self.controller.run(**kwargs)
 
-    def raw_cluster_cmd(self, *args):
+    def raw_cluster_cmd(self, *args, **kwargs):
         """
         Start ceph on a raw cluster.  Return count
         """
-        return self.run_cluster_cmd(**{'args': args,
-                                       'stdout': StringIO()}).stdout.getvalue()
+        stdout = kwargs.pop('stdout', StringIO())
+        p = self.run_cluster_cmd(args=args, stdout=stdout, **kwargs)
+        return p.stdout.getvalue()
 
     def raw_cluster_cmd_result(self, *args, **kwargs):
         """

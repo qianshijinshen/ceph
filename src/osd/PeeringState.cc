@@ -6701,6 +6701,7 @@ PeeringState::Deleting::Deleting(my_context ctx)
     NamedState(context< PeeringMachine >().state_history, "Started/ToDelete/Deleting")
 {
   context< PeeringMachine >().log_enter(state_name);
+
   DECLARE_LOCALS;
   ps->deleting = true;
   ObjectStore::Transaction &t = context<PeeringMachine>().get_cur_transaction();
@@ -6721,8 +6722,11 @@ boost::statechart::result PeeringState::Deleting::react(
   const DeleteSome& evt)
 {
   DECLARE_LOCALS;
-  pl->do_delete_work(context<PeeringMachine>().get_cur_transaction());
-  return discard_event();
+  std::pair<ghobject_t, bool> p;
+  p = pl->do_delete_work(context<PeeringMachine>().get_cur_transaction(),
+    next);
+  next = p.first;
+  return p.second ? discard_event() : terminate();
 }
 
 void PeeringState::Deleting::exit()

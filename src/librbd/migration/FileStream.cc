@@ -20,7 +20,11 @@
 namespace librbd {
 namespace migration {
 
-static std::string FILE_PATH {"file_path"};
+namespace {
+
+const std::string FILE_PATH {"file_path"};
+
+} // anonymous namespace
 
 #ifdef BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR
 
@@ -117,7 +121,8 @@ struct FileStream<I>::ReadRequest {
 template <typename I>
 FileStream<I>::FileStream(I* image_ctx, const json_spirit::mObject& json_object)
   : m_cct(image_ctx->cct), m_asio_engine(image_ctx->asio_engine),
-    m_json_object(json_object), m_strand(*m_asio_engine) {
+    m_json_object(json_object),
+    m_strand(boost::asio::make_strand(*m_asio_engine)) {
 }
 
 template <typename I>
@@ -135,6 +140,7 @@ void FileStream<I>::open(Context* on_finish) {
   if (file_path_value.type() != json_spirit::str_type) {
     lderr(m_cct) << "failed to locate '" << FILE_PATH << "' key" << dendl;
     on_finish->complete(-EINVAL);
+    return;
   }
 
   auto& file_path = file_path_value.get_str();
@@ -204,6 +210,11 @@ void FileStream<I>::open(Context* on_finish) {
 
 template <typename I>
 void FileStream<I>::close(Context* on_finish) {
+  on_finish->complete(-EIO);
+}
+
+template <typename I>
+void FileStream<I>::get_size(uint64_t* size, Context* on_finish) {
   on_finish->complete(-EIO);
 }
 
